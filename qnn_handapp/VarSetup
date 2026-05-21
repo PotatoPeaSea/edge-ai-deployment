@@ -1,0 +1,11 @@
+# Environment variables required to run the QNN hand demo on QCS6490.
+# Usage: source VarSetup
+
+# Paths searched by FastRPC when loading the Hexagon DSP skel library
+# (libQnnHtpV68Skel.so). Must include the dsp/lib directory — without it
+# the DSP session fails with "Failed to load skel, error: 1002".
+export ADSP_LIBRARY_PATH="/data/local/tmp/snpeexample/dsp/lib;/data/local/tmp/snpeexample/aarch64-ubuntu-gcc9.4/lib;/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp"
+
+# /data is mounted noexec by default on this device. Without remounting,
+# libqnn_shim.so and the QNN backend libs cannot be loaded.
+mount -o remount,exec /data

@@ -1,0 +1,25 @@
+Edge AI Deployment — Third-Party Notices
+==========================================
+
+This project depends on or incorporates work from the following:
+
+1. Qualcomm AI Engine Direct (QNN) SDK / QAIRT v2.46.0
+   Copyright (c) Qualcomm Innovation Center, Inc.
+   The C++ shim (qnn_handapp/qnn_shim.cpp) is compiled against QNN SDK headers
+   (QnnInterface.h, QnnSystem.h, QnnTypes.h, etc.) which are proprietary to
+   Qualcomm. The SDK must be obtained separately under Qualcomm's license:
+   https://www.qualcomm.com/developer/software/qualcomm-ai-runtime-sdk
+
+2. MediaPipe Hand Detection Models
+   Original work Copyright (c) Google LLC.
+   Licensed under the Apache License, Version 2.0.
+   https://github.com/google/mediapipe
+   The compiled QNN context binaries (.bin) were produced via Qualcomm AI Hub
+   from the MediaPipe Hand model:
+   https://aihub.qualcomm.com/models/mediapipe_hand
+
+3. Qualcomm AI Hub
+   The model binaries were exported and compiled using the Qualcomm AI Hub
+   cloud compilation service. Use of those binaries is subject to the
+   Qualcomm AI Hub Terms of Service:
+   https://aihub.qualcomm.com

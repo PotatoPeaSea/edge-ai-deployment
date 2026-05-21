@@ -1,0 +1,23 @@
+# Compiled model binaries (obtain from Qualcomm AI Hub — see README)
+*.bin
+*.bin.onnx.zip
+
+# Compiled shared libraries (built on-device from qnn_handapp/qnn_shim.cpp)
+*.so
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test inputs / output artifacts
+*.raw
+*_out.jpg
+input_list.txt
+
+# QNN run output directories
+output_*/
+
+# OS / editor
+.DS_Store
+*.swp
