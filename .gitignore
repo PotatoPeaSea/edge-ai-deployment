@@ -15,6 +15,11 @@ __pycache__/
 *_out.jpg
 input_list.txt
 
+# Live capture artifacts (regenerated each run)
+facemap_live.jpg
+facemap_live.mp4
+*.mp4
+
 # QNN run output directories
 output_*/
 

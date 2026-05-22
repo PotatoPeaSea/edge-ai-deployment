@@ -1,0 +1,7 @@
+# Environment setup for FaceMap demo on QCS6490.
+# Usage: source VarSetup
+
+export ADSP_LIBRARY_PATH="/data/local/tmp/snpeexample/dsp/lib;/data/local/tmp/snpeexample/aarch64-ubuntu-gcc9.4/lib;/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp"
+export LD_LIBRARY_PATH="/data/local/tmp/snpeexample/aarch64-ubuntu-gcc9.4/lib:$LD_LIBRARY_PATH"
+
+mount -o remount,exec /data

@@ -1,0 +1,47 @@
+{
+    "model_id": "facemap_3dmm",
+    "model_name": "Facial-Landmark-Detection",
+    "runtime": "qnn_dlc",
+    "precision": "w8a8",
+    "tool_versions": {
+        "qairt": "2.45.0.260326154327"
+    },
+    "model_files": {
+        "facemap_3dmm.dlc": {
+            "inputs": {
+                "image": {
+                    "shape": [
+                        1,
+                        128,
+                        128,
+                        3
+                    ],
+                    "dtype": "uint8",
+                    "quantization_parameters": {
+                        "scale": 0.00392144825309515,
+                        "zero_point": 0
+                    },
+                    "io_type": "image",
+                    "image_metadata": {},
+                    "value_range": [
+                        0.0,
+                        1.0
+                    ]
+                }
+            },
+            "outputs": {
+                "parameters_3dmm": {
+                    "shape": [
+                        1,
+                        265
+                    ],
+                    "dtype": "uint8",
+                    "quantization_parameters": {
+                        "scale": 0.05238991975784302,
+                        "zero_point": 123
+                    }
+                }
+            }
+        }
+    }
+}

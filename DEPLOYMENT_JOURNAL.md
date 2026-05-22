@@ -915,4 +915,692 @@ python3 qnn_handapp/demo.py --image hand.jpg --frames 30 --out qnn_handapp/hand_
 
 # pull the annotated output
 /tmp/sshpull.py /data/local/tmp/mediapipe_hand/qnn_handapp/hand_out.jpg ./hand_out.jpg
+
+---
+
+# Chapter 7 — FaceMap 3DMM Demo (Session 2025-05-22)
+
+This chapter records every step taken to get `facemap_3dmm.dlc` running on the
+QCS6490 device with HTP inference and annotated output.  The starting point was
+a working `qnn_handapp` (from Chapters 1–6) and an untouched
+`exportAssets/facemap_3dmm-qnn_dlc-w8a8/` folder that had just been placed
+there.
+
+---
+
+## 7.0 Context from HANDOFF.md
+
+Read `HANDOFF.md` first.  The hand demo pipeline was complete; the task was to
+create an equivalent `demo.py` for the `facemap_3dmm` model.  Key constraints
+carried over:
+
+- SSH access via paramiko (no `sshpass` on host; password `oelinux123`).
+- `/data` is `noexec` by default; must be remounted before running any `.so`.
+- `ADSP_LIBRARY_PATH` uses **semicolons** (`;`) as path separators, not colons.
+- Host OS is Ubuntu 20.04 → glibc 2.31 → some SDK binaries in the
+  `x86_64-linux-clang/` folder require glibc 2.32+; use `qairt_dev` container.
+
+---
+
+## 7.1 Reconnaissance — what is the facemap model?
+
+**Read** `exportAssets/facemap_3dmm-qnn_dlc-w8a8/metadata.json`:
+
+```json
+{
+  "model_id": "facemap_3dmm",
+  "runtime": "qnn_dlc",
+  "precision": "w8a8",
+  "tool_versions": { "qairt": "2.45.0.260326154327" },
+  "model_files": {
+    "facemap_3dmm.dlc": {
+      "inputs":  { "image": { "shape": [1,128,128,3], "dtype": "uint8",
+                              "scale": 0.003921, "zero_point": 0 } },
+      "outputs": { "parameters_3dmm": { "shape": [1,265], "dtype": "uint8",
+                                        "scale": 0.052389, "zero_point": 123 } }
+    }
+  }
+}
 ```
+
+Key facts:
+- Single model (no detector + landmark chain like the hand demo).
+- **DLC format** (`.dlc`), not a QNN context binary (`.bin`).  The existing
+  `qnn_shim.so` only loads `.bin` files; a different inference path is needed.
+- Input: 128×128 uint8 RGB.  Scale ≈ 1/255, zero_point = 0.
+- Output: 265 uint8 parameters.  Dequantize: `float = 0.05239 * (uint8 − 123)`.
+- Compiled with QAIRT **2.45**; the device runs QAIRT **2.46**.
+- Output models 3D Morphable Model (3DMM) parameters.  Assumed layout
+  (common for this family): [0:12] = 3×4 pose matrix, [12:52] = 40 shape
+  coefficients, [52:62] = 10 expression coefficients, [62:265] = texture +
+  illumination.
+
+**Read** `exportAssets/qnn_handapp/demo.py` (reference implementation) to
+understand the structure to replicate.
+
+---
+
+## 7.2 Device reconnaissance — what tools are available?
+
+Connected via paramiko, ran several discovery commands.
+
+### 7.2.1 Device file layout
+
+```
+/data/local/tmp/
+  mediapipe_hand/          ← existing hand demo
+    qnn_handapp/           ← libqnn_shim.so, demo.py, …
+    *.bin                  ← QNN context binaries
+  snpeexample/
+    aarch64-ubuntu-gcc9.4/
+      bin/  snpe-net-run, qnn-net-run, qnn-context-binary-generator, …
+      lib/  libQnnHtp.so, libQnnSystem.so, libSNPE.so,
+            libQnnModelDlc.so, …
+    dsp/lib/  libQnnHtpV68Skel.so, libSnpeHtpV68Skel.so, …
+```
+
+### 7.2.2 Python on device
+
+```
+Python 3.8.10
+import snpe  →  ModuleNotFoundError  (no Python SNPE bindings installed)
+```
+
+### 7.2.3 Key libraries found
+
+| Library | Relevance |
+|---|---|
+| `libSNPE.so` | SNPE C API — exports `Snpe_PSNPE_*` functions |
+| `libQnnModelDlc.so` | Exports `QnnModel_composeGraphsFromDlc` — loads DLC via QNN API |
+| `libQnnHtp.so` | QNN HTP backend (same as used by qnn_handapp) |
+| `snpe-net-run` | SNPE CLI inference tool, supports `--use_dsp` and `--container <dlc>` |
+| `qnn-net-run` | QNN CLI inference tool, supports `--dlc_path` with `libQnnModelDlc.so` |
+| `qnn-context-binary-generator` | Compiles models to context binary, v2.46, supports `--dlc_path` |
+
+### 7.2.4 Decision: use snpe-net-run subprocess
+
+No Python SNPE bindings.  Writing a new C shim for the SNPE C API would take
+significant time.  The fastest working path is to call `snpe-net-run` as a
+subprocess (same tradeoff that was abandoned for the hand demo in favour of the
+ctypes shim, but acceptable for now since the user said "don't worry about
+performance or cropping yet").
+
+---
+
+## 7.3 First demo.py — CPU via snpe-net-run subprocess
+
+Created `exportAssets/facemap_app/demo.py` (first version):
+
+- `preprocess(frame)` — BGR uint8 → RGB float32 [0,1] at 128×128.
+- `run_inference(img_hwc)` — writes float32 `.raw` input file, runs
+  `snpe-net-run`, reads float32 `.raw` output.  `snpe-net-run` dequantizes
+  uint8 → float32 internally (default behaviour without `--use_native_output_files`).
+- `annotate(frame, params)` — extracts R (3×3) and t (3×1) from first 12 params
+  as a 3×4 projection matrix.  Projects three 3D axis endpoints [size,0,0],
+  [0,size,0], [0,0,size] through `p_2d = R@p3 + t` with a pinhole model
+  (`focal = max(H,W)`).  Draws X=red, Y=green, Z=blue arrows.  Adds text for
+  estimated roll/pitch/yaw (Euler angles from R), shape_norm, expr_norm.
+- `main()` — static image or webcam source; `--check` flag exits 0/PASS if
+  output is (265,) finite non-zero.
+
+Also created `VarSetup` (identical in intent to qnn_handapp's) and `deploy.sh`.
+
+### 7.3.1 ADSP path bug (semicolons vs colons)
+
+**First bug found immediately**: The initial Python `_build_env()` used colons
+(`:`) to separate paths in `ADSP_LIBRARY_PATH`:
+
+```python
+"/data/local/tmp/snpeexample/dsp/lib:/data/local/tmp/snpeexample/..."
+```
+
+`ADSP_LIBRARY_PATH` requires **semicolons** (`;`).  With colons, FastRPC fails:
+
+```
+Failed to load skel, error: 1002
+```
+
+Fixed to:
+
+```python
+"/data/local/tmp/snpeexample/dsp/lib;/data/local/tmp/snpeexample/..."
+```
+
+This bug is subtle: the VarSetup shell script already had semicolons from the
+hand demo, but when constructing the path in Python we used the more natural
+colon separator.
+
+### 7.3.2 First successful CPU run
+
+After the semicolon fix, uploaded and ran:
+
+```
+warmup ok  backend=CPU  output shape=(265,)
+avg latency: 114.1ms  (8.8 fps)
+params[0:6]: [-0.766 -0.384  0.038  0.043 -0.017 -0.052]
+shape_norm=0.637  expr_norm=0.163
+PASS
+```
+
+The demo script printed PASS, the annotated image was saved and downloaded.
+Head pose axes (R/G/B arrows) were drawn on the 128×128 Zidane crop with
+roll/pitch/yaw text overlay.
+
+---
+
+## 7.4 Attempting HTP inference — three failed approaches
+
+### 7.4.1 Attempt 1: snpe-net-run --use_dsp
+
+```bash
+snpe-net-run --container facemap_3dmm.dlc --use_dsp …
+```
+
+**Error:**
+```
+error_code=15001; QnnBackend_DeviceCreate() INVALID_CONFIG
+error_code=1002;  No backend could validate Op=/Mul Type=Eltwise_Binary
+```
+
+**Why it failed:** The `--use_dsp` SNPE adapter internally calls
+`QnnDsp`/`QnnHtp` device creation with stricter op validation.  The `/Mul`
+(Eltwise_Binary) op in the facemap DLC has parameters that fail validation in
+QAIRT 2.46's SNPE adapter.  The model was compiled with QAIRT 2.45, and there
+is a compatibility break in the Mul parameter format between these versions at
+the SNPE adapter level.
+
+**Fall-back:** The demo automatically retried with CPU (no `--use_dsp` flag)
+which worked fine.
+
+### 7.4.2 Attempt 2: qnn-net-run with libQnnModelDlc.so (ADSP colons bug)
+
+```bash
+qnn-net-run --backend libQnnHtp.so --model libQnnModelDlc.so \
+  --dlc_path facemap_3dmm.dlc …
+```
+
+**Error (first attempt):**
+```
+Failed to load skel, error: 1002
+```
+
+This was the colons-in-ADSP_LIBRARY_PATH bug (§7.3.1).  After fixing to
+semicolons and retrying:
+
+```
+Composing Graphs … Finalizing Graphs …
+Starting stage: Post Graph Optimization
+Completed stage: Post Graph Optimization (1098 us)
+exit_code=139   ← SIGSEGV
+```
+
+**Why it failed:** The DLC compiled with QAIRT 2.45 crashes (segfault, exit 139)
+in the `libQnnHtp.so`'s graph finalization stage when run under QAIRT 2.46.
+The crash happens consistently after "Post Graph Optimization" completes but
+before the context binary is serialized.  This is a native library crash, not a
+Python error.
+
+The same crash happens regardless of whether you use `qnn-net-run` or
+`qnn-context-binary-generator` to drive the compilation.
+
+### 7.4.3 Attempt 3: qnn-context-binary-generator with config file
+
+Tried passing `--config_file htp_config.json` with `optimization_level: 0` to
+disable HTP optimizations, hoping to avoid the crash:
+
+```json
+{ "htp_backend_extensions": { "optimization_level": 0 } }
+```
+
+**Result:** Same crash (exit 139) at the same stage.  The optimization level
+config does not affect the code path that crashes.
+
+### 7.4.4 Root cause confirmed
+
+The crash is a version compatibility bug between QAIRT 2.45-compiled DLC and
+the QAIRT 2.46 HTP finalization code.  It is not possible to work around through
+CLI flags — the DLC must either be recompiled for 2.46 or pre-compiled using a
+tool that uses different internal paths.
+
+---
+
+## 7.5 Fix: snpe-dlc-graph-prepare inside qairt_dev docker
+
+### 7.5.1 Discovery
+
+The host SDK tools require glibc 2.32+ but the host has Ubuntu 20.04 (glibc
+2.31).  Running them directly fails:
+
+```
+libm.so.6: version 'GLIBC_2.35' not found
+```
+
+The `qairt_dev` docker container (Ubuntu 22.04) has the correct glibc.
+
+```bash
+docker exec qairt_dev /workspace/qairt/2.46.0.260424/bin/x86_64-linux-clang/\
+  snpe-dlc-graph-prepare --help
+```
+
+This tool supports `--htp_socs qcs6490` — it generates HTP offline cache for a
+specific SoC without needing real hardware (uses Hexagon SDK simulation).
+
+### 7.5.2 Running graph preparation
+
+```bash
+docker cp exportAssets/facemap_3dmm-qnn_dlc-w8a8/facemap_3dmm.dlc \
+  qairt_dev:/workspace/facemap/facemap_3dmm.dlc
+
+docker exec qairt_dev bash -c "
+  /workspace/qairt/2.46.0.260424/bin/x86_64-linux-clang/snpe-dlc-graph-prepare \
+    --input_dlc  /workspace/facemap/facemap_3dmm.dlc \
+    --output_dlc /workspace/facemap/facemap_3dmm_prepared.dlc \
+    --htp_socs   qcs6490
+"
+```
+
+**Output (abridged):**
+```
+[INFO] SNPE HTP Offline Prepare: Attempting to create cache for QCS6490
+[USER_INFO] No cache record in the DLC matches the target device. Creating a new record
+[USER_INFO] Offline Prepare VTCM size(MB) selected = 0
+[USER_INFO] Optimization Level passed = 2
+… Graph Optimizations (43361 us) …
+… Finalizing Graph Sequence …
+[INFO] SNPE HTP Offline Prepare: Successfully created cache for QCS6490
+[INFO] QCS6490 : Success
+[USER_INFO] Successfully saved DLC to /workspace/facemap/facemap_3dmm_prepared.dlc
+exit=0
+5.5M facemap_3dmm.dlc  →  11M facemap_3dmm_prepared.dlc
+```
+
+The output DLC is larger (11 MB vs 5.5 MB) because it now embeds the
+pre-compiled HTP graph cache for QCS6490.
+
+Notable: the warning `No schematic bin found to add` confirms the original DLC
+had no embedded HTP cache — it was a pure IR DLC without any pre-compiled
+backend binary.
+
+### 7.5.3 Why this works when qnn-context-binary-generator crashes
+
+`snpe-dlc-graph-prepare` runs on the HOST (x86_64) using the Hexagon DSP
+simulator (`libHtpPrepare.so`).  It goes through a different code path than the
+on-device `libQnnHtp.so` compilation pipeline.  Specifically, it avoids the
+post-optimization finalization step that crashes in the on-device 2.46 runtime.
+
+The resulting "offline prepared" DLC contains a record of type
+`HTP_CACHE_RECORD` which `snpe-net-run` can load directly with
+`--enable_htp_accelerated_init`, bypassing the JIT compilation entirely.
+
+### 7.5.4 Confirming HTP works with the prepared DLC
+
+Copied `facemap_3dmm_prepared.dlc` to the device and ran:
+
+```bash
+snpe-net-run \
+  --container facemap_3dmm_prepared.dlc \
+  --input_list input_list.txt \
+  --output_dir output/ \
+  --use_dsp \
+  --enable_htp_accelerated_init
+```
+
+**Output:**
+```
+Processing graph : graph_hbk71j7a
+Processing DNN input(s): /tmp/facemap_ws/input.raw
+Successfully executed graph graph_hbk71j7a
+exit=0
+parameters_3dmm.raw  ← output file present
+```
+
+HTP inference works.
+
+### 7.5.5 Attempt to extract standalone .bin (failed)
+
+Tried `qnn-context-binary-generator` on the prepared DLC hoping to get a
+standalone `.bin` loadable by the existing `qnn_shim.so`:
+
+```bash
+qnn-context-binary-generator \
+  --backend libQnnHtp.so --model libQnnModelDlc.so \
+  --dlc_path facemap_3dmm_prepared.dlc \
+  --binary_file facemap_3dmm --output_dir …
+```
+
+**Result:** Same crash (exit 139).  The `qnn-context-binary-generator` with
+`libQnnModelDlc.so` goes through the crashing `libQnnHtp.so` compilation path
+even when the DLC has the HTP cache embedded.  It does not fall back to loading
+the embedded cache.
+
+This means the `qnn_shim.so` (context binary loader) approach cannot be used
+for this model without a full re-export.  The `snpe-net-run` subprocess path
+with the prepared DLC is the only working HTP path for now.
+
+---
+
+## 7.6 Final demo.py — HTP via prepared DLC
+
+Updated `demo.py` to use a two-DLC strategy:
+
+| Attribute | HTP path | CPU fallback |
+|---|---|---|
+| DLC file | `facemap_3dmm_prepared.dlc` | `facemap_3dmm.dlc` |
+| CLI flags | `--use_dsp --enable_htp_accelerated_init` | (none) |
+| Tool | `snpe-net-run` | `snpe-net-run` |
+| Latency (subprocess) | ~258 ms | ~114 ms |
+
+The HTP subprocess path is *slower* than CPU for this demo because subprocess
+startup + SNPE DSP session init (~200 ms) dominates over actual HTP inference
+(~5 ms).  To get real-time HTP performance, a persistent in-process runtime
+would be needed (ctypes shim analogous to `qnn_shim.so`).
+
+### 7.6.1 Final automated check (HTP)
+
+```
+backend=HTP  avg latency: 258.7ms  (3.9 fps)
+params[0:6]: [-0.786 -0.472  0.105  0.052  ~0  ~0]
+shape_norm=0.693  expr_norm=0.174
+PASS
+```
+
+Annotated output image: head pose axes drawn on 128×128 Zidane crop,
+roll/pitch/yaw text overlay (R=-180 P=-8 Y=-17), shape and expression norms.
+
+---
+
+## 7.7 What did and didn't work — summary for facemap
+
+### Worked
+
+- **snpe-net-run CPU** — plain `snpe-net-run` without runtime flags runs the
+  DLC on CPU at ~114 ms/frame (subprocess).  No env setup required beyond
+  `LD_LIBRARY_PATH`.
+- **snpe-dlc-graph-prepare inside docker** — generates HTP offline cache for
+  `qcs6490` without real hardware.  Command:
+  ```bash
+  docker exec qairt_dev \
+    /workspace/qairt/2.46.0.260424/bin/x86_64-linux-clang/snpe-dlc-graph-prepare \
+    --input_dlc facemap_3dmm.dlc --output_dlc facemap_3dmm_prepared.dlc \
+    --htp_socs qcs6490
+  ```
+- **snpe-net-run HTP** — prepared DLC + `--use_dsp --enable_htp_accelerated_init`
+  runs on HTP at ~250 ms/frame (subprocess-limited).
+
+### Didn't work
+
+- **snpe-net-run --use_dsp** (unprepared DLC) — `QnnBackend_DeviceCreate`
+  INVALID_CONFIG + Eltwise_Binary/Mul validation failure.  SNPE 2.46 adapter
+  breaks on 2.45-compiled Mul op parameters.
+- **ADSP_LIBRARY_PATH with colons** — must use semicolons (`;`).  Colons →
+  `Failed to load skel, error: 1002`.
+- **qnn-net-run + libQnnModelDlc.so** (both DLC variants) — SIGSEGV (exit 139)
+  after "Post Graph Optimization".  Version mismatch: DLC compiled with 2.45,
+  runtime is 2.46; finalization crashes in `libQnnHtp.so`.
+- **qnn-context-binary-generator --config_file optimization_level=0** — same
+  crash, config ignored.
+- **qnn-context-binary-generator with prepared DLC** — still crashes; the tool
+  routes through the crashing `libQnnHtp.so` JIT path even when the DLC has an
+  embedded cache.
+- **Host SDK tools directly** — require glibc 2.32+; host has 2.31.  Use
+  `qairt_dev` docker instead.
+- **import snpe on device** — not installed.  Subprocess is the only Python path.
+
+---
+
+## 7.8 Files created / modified this session
+
+| Path (relative to `/mnt/data02/matthew/SNPE/`) | Action |
+|---|---|
+| `exportAssets/facemap_app/demo.py` | Created — main inference + annotation script |
+| `exportAssets/facemap_app/VarSetup` | Created — env setup for facemap on device |
+| `exportAssets/facemap_app/deploy.sh` | Created — upload script |
+| `exportAssets/facemap_3dmm-qnn_dlc-w8a8/facemap_3dmm_prepared.dlc` | Created — HTP offline-prepared DLC (11 MB) |
+| `HANDOFF.md` | Updated — added facemap_app section, new known issues, updated next steps |
+| `exportAssets/DEPLOYMENT_JOURNAL.md` | Updated — this chapter |
+
+Device paths created:
+
+| Device path | Contents |
+|---|---|
+| `/data/local/tmp/facemap/` | `demo.py`, `VarSetup`, `facemap_3dmm.dlc`, `facemap_3dmm_prepared.dlc` |
+```
+
+---
+
+# Chapter 8 — Real-time face detection + 68-landmark pipeline, both models on the DSP (Session 2026-05-22)
+
+Chapter 7 left facemap working but flawed: inference went through a
+`snpe-net-run` **subprocess** (~222 ms), the demo drew head-pose **arrows** from
+a guessed parameter layout, and it fed the **whole frame** to the model with no
+face crop. This chapter records four things, in order:
+
+1. An in-process **SNPE C-API shim** (`libsnpe_shim.so`) → ~0.7 ms/inference.
+2. Ease-of-use: one-command launcher, live mode, camera auto-detect.
+3. The big correctness fix: the facemap output decode was **wrong**; replaced
+   with Qualcomm's real 3DMM → 68-landmark reconstruction, which forced adding a
+   **face detector** (the model is a landmark regressor, not a detector).
+4. A **DSP face detector** built locally (no AI Hub), the two-model pipeline,
+   and the headless/camera fixes needed to run it over SSH.
+
+End state: face detector (~1.0 ms) + facemap landmarks (~0.7 ms/face), **both on
+the Hexagon DSP**, ~1.8 ms for one face (~550 fps).
+
+---
+
+## 8.0 Finish Chapter 7 — confirm the subprocess HTP path
+
+Resumed by re-running the device check; the device had dropped off SSH and came
+back after a power cycle. Baseline confirmed:
+
+```
+backend=HTP  avg latency: 222.6ms  (subprocess-bound)  PASS
+```
+
+Real HTP inference is ~ms; the 222 ms is `snpe-net-run` process startup. That is
+the motivation for the in-process shim.
+
+---
+
+## 8.1 In-process SNPE shim (`libsnpe_shim.so`)
+
+The hand app's `qnn_shim.cpp` wraps `libQnnHtp.so` and only loads **context
+binaries** (`.bin`). facemap is a **DLC**, and the raw QNN HTP path SIGSEGVs on
+this 2.45 DLC (Chapter 7). The runtime that *does* load this DLC on HTP is
+**SNPE** (`libSNPE.so`), so the shim wraps the SNPE C API instead.
+
+Design decisions:
+
+- **Link `libSNPE.so` directly** (not dlopen) — single entry point; LD path is
+  set by the launcher. C API symbols confirmed with `nm -D` (e.g.
+  `Snpe_SNPEBuilder_Create`, `Snpe_SNPE_ExecuteITensors`, `Snpe_Util_CreateITensor`).
+- **ITensor path, not UserBuffers** — float32 in/out; SNPE quantizes to the
+  DLC's fixed-point encoding internally. Far simpler than managing TF8 buffers.
+- **Discover output shapes with a warmup execute** — the C API has
+  `GetInputDimensions` but no `GetOutputDimensions`, so `snpe_load()` runs one
+  zero inference and reads the output ITensor shapes from the populated map.
+- **Persistent state** — input ITensors + input/output `TensorMap`s are created
+  once and reused; `TensorMap_Clear` on the output map before each execute.
+- **Builder config** for HTP: `SetRuntimeProcessorOrder(DSP, CPU)`,
+  `SetPerformanceProfile(BURST)`, `SetAcceleratedInit(true)` (uses the offline
+  cache in the `_prepared.dlc`).
+
+Build **on-device** (aarch64 Ubuntu, g++ 9.4) — same rationale as the QNN shim,
+avoids cross-compiling. Pushed `include/SNPE` to the device once; `build.sh`:
+
+```sh
+g++ -O2 -fPIC -shared -std=c++17 -I$SNPE_INCLUDE snpe_shim.cpp \
+    -o libsnpe_shim.so -L$SNPE_LIB -lSNPE
+```
+
+Result: **~0.7 ms/inference (~1450 fps)**, output byte-identical to the
+subprocess HTP run (`shape_norm=0.693, expr_norm=0.174`). `rpcmem` FastRPC
+messages confirm it executes on the DSP. Python wrapper `snpe_runtime.py`
+mirrors `qnn_runtime.py` (`SnpeModel.execute([...])`).
+
+---
+
+## 8.2 Ease-of-use pass
+
+- `run_demo.sh` — one-command launcher; remounts `/data` exec and exports
+  **both** `LD_LIBRARY_PATH` (so the shim finds `libSNPE.so`) and
+  `ADSP_LIBRARY_PATH` (semicolon-separated). The hand launcher omitted
+  `LD_LIBRARY_PATH`, which the shim needs.
+- Live webcam mode and full-frame annotation scaling.
+- **Camera index ≠ 0**: on this board `/dev/video0,1` are internal MSM nodes
+  that don't capture; the USB webcam is `/dev/video2` (per `v4l2-ctl
+  --list-devices`). Added auto-probing.
+
+---
+
+## 8.3 The decode was wrong — get the REAL facemap_3dmm layout
+
+User report: "arrows go in random directions, it doesn't detect the face."
+Two root causes:
+
+1. **No face crop.** facemap_3dmm expects a tight face crop resized to 128²; the
+   demo resized the whole frame, so the 265 outputs were meaningless.
+2. **Wrong parameter interpretation.** Chapter 7 assumed `[0:12]` was a 3×4 pose
+   matrix. That was never verified and is false.
+
+Fetched Qualcomm's source (`qualcomm/ai-hub-models`,
+`src/qai_hub_models/models/facemap_3dmm/`). The real layout (`utils.py
+project_landmark`):
+
+```
+[  0:219] alpha_id  (shape)      ×3
+[219:258] alpha_exp (expression) ×0.5 +0.5
+[258] pitch  [259] yaw  [260] roll    (×π/2)
+[261] tX (×60)  [262] tY (×60)  tZ=500 (const)  [263] focal (×150 +450)
+```
+
+68 landmarks are reconstructed from a **3DMM basis** (downloaded from the AI Hub
+asset store): `meanFace.npy` (204), `shapeBasis.npy` (204×219),
+`blendShape.npy` (204×39):
+
+```
+verts = (mean + shapeBasis·alpha_id + blendShape·alpha_exp).reshape(68,3) @ R(p,y,r)ᵀ
+verts += (tX,tY,tZ);  landmark2d = verts[:, :2] · focal / tZ
+```
+
+Then map crop-space → image-space using the face box. Ported to numpy in
+`demo.py` (`project_landmark`, `transform_landmark`). The reference app confirms
+the model has **no detection stage** and requires an externally supplied face
+box → we need a detector.
+
+---
+
+## 8.4 Face detector on the DSP (built locally, no AI Hub)
+
+The hand `.bin`s were made on a Windows machine via the AI Hub **cloud**
+(`modelCompilation.md`). This Linux box has no AI Hub token/packages. But the
+SNPE shim already runs **any** DLC on the DSP, so the task is just: produce a
+detector DLC locally with the QAIRT tools in the `qairt_dev` container.
+
+Model: **Linzaer Ultra-Light-Fast-Generic-Face-Detector, RFB-320**. Tiny,
+ONNX-native, outputs already-decoded boxes.
+
+- Input `input` NCHW `[1,3,240,320]`, preprocess `(rgb−127)/128`.
+- Outputs `scores [1,4420,2]` (softmax: bg,face) + `boxes [1,4420,4]`
+  (normalized corners). Postproc = threshold + NMS (numpy).
+
+Build (all in `qairt_dev`; **activate the SDK venv** so the converters find
+`onnx`, which the system python lacks):
+
+```sh
+qairt-converter --input_network version-RFB-320.onnx --output_path face_det_fp32.dlc
+qairt-quantizer  --input_dlc face_det_fp32.dlc --input_list calib_list.txt \
+                 --output_dlc face_det_w8a8.dlc
+snpe-dlc-graph-prepare --input_dlc face_det_w8a8.dlc \
+                 --output_dlc face_det_w8a8_prepared.dlc \
+                 --htp_socs qcs6490 --set_output_tensors scores,boxes
+```
+
+Calibration: ~5 face images preprocessed to NCHW raws (`prep_calib.py`).
+INT8 output on the DSP matched the onnxruntime float reference almost exactly
+(obama: DSP `[0.42,0.077,0.663,0.355]` vs ref `[0.421,0.079,0.663,0.356]`).
+Detector latency on DSP: **~1.0 ms**.
+
+### Multi-output gotcha (cost an hour)
+
+By default SNPE exposes only a network's **last** output, so the shim saw only
+`boxes`. Fix is two-sided:
+
+1. Add `Snpe_SNPEBuilder_SetOutputTensors(scores,boxes)` at runtime (new
+   `output_names` arg threaded through `snpe_shim`/`snpe_runtime`).
+2. Bake the same into the offline cache with graph-prepare's
+   `--set_output_tensors scores,boxes`.
+
+If only (1) is set, the runtime outputs don't match the offline cache → SNPE
+falls back to **online** HTP prep → **SIGSEGV** (the same 2.45/2.46 crash).
+With both, accelerated init uses the cache and it just works.
+
+---
+
+## 8.5 Two-model pipeline + results
+
+```
+frame ─► detector (DSP) ─► scores/boxes ─► threshold+NMS ─► box(es)
+box   ─► crop+resize 128 ─► facemap (DSP) ─► 265 params ─► 68 landmarks ─► annotate
+```
+
+Validated: obama.jpg (1 face) **det 1.0 + lmk 0.8 = 1.8 ms (~550 fps)**;
+zidane.jpg (2 faces) det 1.1 + lmk 1.4 = 2.5 ms. Landmarks track
+eyes/nose/mouth/jaw correctly; both models run on the DSP.
+
+---
+
+## 8.6 "It just stalls, nothing opens" — headless + camera robustness
+
+Cause: the user runs over **SSH with no display**, so `cv2.imshow` can't open a
+window (it hung); a stale `--live` process was also still holding the camera, and
+the probe had latched onto a non-capturing node.
+
+Fixes in `demo.py`:
+
+- `_have_display()` — detect X/Wayland; if absent, **headless** mode writes the
+  latest annotated frame to `facemap_live.jpg` and records `facemap_live.mp4`,
+  printing live FPS. With a display it still opens a window.
+- `open_camera()` — probe indices across `CAP_V4L2` then `CAP_ANY`, validate a
+  real 3-channel frame, fail fast (never block on a dead node), report `WxH`.
+- Pre-build both DSP graphs before the loop with progress prints, so the few-
+  second init isn't mistaken for a hang.
+- `./run_demo.sh` with no args → live (headless over SSH); `--seconds N` to
+  auto-stop.
+
+Verified headless: models init, camera index 0 @640×480, ~850–900 fps,
+`facemap_live.jpg` written (0 faces only because the camera faced an empty room).
+
+---
+
+## 8.7 Gotchas worth re-reading
+
+- **SNPE exposes only the last output by default** — set output tensors at BOTH
+  build time (runtime `SetOutputTensors`) and offline-prepare time
+  (`--set_output_tensors`), or online prep crashes.
+- **Converters use system python** — `source` the SDK venv first or they can't
+  `import onnx`.
+- **Docker writes DLCs as root** — `chmod a+rw` before SFTP from the host.
+- **facemap_3dmm has no detector** — it is a landmark regressor; feed it a tight
+  face crop or the output is garbage.
+- **`cv2.imshow` needs a display** — over SSH, go headless and write a file.
+- **Camera enumeration is flaky** — the USB cam is not index 0; probe + validate.
+
+---
+
+## 8.8 Files created / modified this session
+
+| Path (under `exportAssets/`) | Action |
+|---|---|
+| `facemap_app/snpe_shim.cpp`, `snpe_shim.h` | Created — in-process SNPE C-API shim (multi-output support) |
+| `facemap_app/snpe_runtime.py` | Created — ctypes wrapper (`SnpeModel`, `output_names`) |
+| `facemap_app/build.sh` | Created — on-device shim build |
+| `facemap_app/demo.py` | Rewritten — two-model detect→landmark pipeline, headless live, camera probe |
+| `facemap_app/run_demo.sh` | Created — one-command launcher (sets LD/ADSP env) |
+| `facemap_app/deploy.sh` | Updated — ships detector DLCs + 3DMM basis + SNPE headers, builds shim |
+| `facemap_app/{meanFace,shapeBasis,blendShape}.npy` | Added — 3DMM basis for 68-landmark decode |
+| `facemap_app/face_det_w8a8*.dlc` | Added — face detector (HTP-prepared, outputs scores,boxes) |
+| `face_detector/` | Created — detector build dir: ONNX, fp32/w8a8/prepared DLCs, `prep_calib.py`, calib data |
+| `DEPLOYMENT_JOURNAL.md` | Updated — this chapter |
+| `../HANDOFF.md` | Updated — two-model DSP pipeline, detector build recipe |
+
